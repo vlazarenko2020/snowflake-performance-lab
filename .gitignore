@@ -1,0 +1,20 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Snowflake CLI / credentials
+config.toml
+*.p8
+*.pem
+*.key
+
+# Script output and generated files
+nohup.out
+*.log
+tmp/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
