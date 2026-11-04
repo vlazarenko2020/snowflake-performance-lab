@@ -9,6 +9,7 @@ A small sandbox for practising Snowflake query performance tuning. It runs a set
 ├── .env.example                     # Config template (copy to .env)
 └── deliberately_inefficient_queries/
     ├── run_deliberately_inefficient_queries.sh   # Generates the SQL and runs it via Snowflake CLI
+    ├── wrapper_run_deliberately_inefficient_queries.sh  # Launches N concurrent instances in the background
     └── inefficient_queries.sql                   # Reference copy of the queries
 ```
 
@@ -55,13 +56,16 @@ cp .env.example .env
 ./deliberately_inefficient_queries/run_deliberately_inefficient_queries.sh
 ```
 
-For a long run in the background:
+To launch several instances in the background, use the wrapper:
 
 ```bash
-nohup ./deliberately_inefficient_queries/run_deliberately_inefficient_queries.sh &
+./deliberately_inefficient_queries/wrapper_run_deliberately_inefficient_queries.sh      # 1 instance (default)
+./deliberately_inefficient_queries/wrapper_run_deliberately_inefficient_queries.sh 5    # 5 instances
 ```
 
-The script writes the SQL to `tmp/inefficient_queries.sql` and runs it with `snow sql`. The final `SELECT` prints the query IDs.
+The wrapper starts the instances one at a time, waiting a random 1-15 seconds between launches. They overlap, so they run concurrently, which is useful for generating concurrent load and queueing. Each instance gets its own log (`tmp/run_<timestamp>_instance<N>.log`) and its own generated SQL file in `tmp/`. Follow progress with `tail -f tmp/run_<timestamp>_instance*.log`.
+
+Running the main script directly writes the SQL to `tmp/inefficient_queries.sql` and executes it with `snow sql`. The final `SELECT` prints the query IDs.
 
 ## Finding the queries afterwards
 
@@ -71,5 +75,5 @@ In Snowsight go to **Monitoring → Query History** and filter by query tag `ine
 
 - `USE_CACHED_RESULT = FALSE` is set so reruns actually execute instead of returning cached results.
 - Temporary tables are dropped automatically when the session ends.
-- The queries on `TPCH_SF10` scan tens of millions of rows. Use a small warehouse and expect some credit consumption.
+- The queries on `TPCH_SF10` scan tens of millions of rows. Use a small warehouse and expect some credit consumption. Each wrapper instance repeats the full set, so credit use scales with the instance count.
 - `.env`, `tmp/` and `nohup.out` are git-ignored. Never commit credentials.
