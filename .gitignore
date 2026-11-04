@@ -14,6 +14,9 @@ nohup.out
 *.log
 tmp/
 
+# Claude Code local instructions
+CLAUDE.md
+
 # OS / editor
 .DS_Store
 .vscode/
