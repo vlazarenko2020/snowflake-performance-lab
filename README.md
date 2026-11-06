@@ -10,21 +10,16 @@ A small sandbox for practising Snowflake query performance tuning. It runs a set
 └── deliberately_inefficient_queries/
     ├── run_deliberately_inefficient_queries.sh   # Generates the SQL and runs it via Snowflake CLI
     ├── wrapper_run_deliberately_inefficient_queries.sh  # Launches N concurrent instances in the background
-    └── inefficient_queries.sql                   # Reference copy of the queries
+    └── inefficient_queries/all_in_one_file.sql   # Query pool (50 numbered queries) the script picks from
 ```
 
 ## The queries
 
-Each query demonstrates one common anti-pattern:
+`all_in_one_file.sql` holds 50 numbered queries (`-- N. Description`, each ending with `;`). Each run picks a random 2-6 of them and sends them to Snowflake together in one session. Every query demonstrates one common anti-pattern (for example a function on a filter column that defeats pruning, a Cartesian or exploding join, a correlated subquery, an unpartitioned window function, or a huge sort), and the description in its header comment names it.
 
-| # | Anti-pattern | What to look for in Query Profile |
-|---|--------------|-----------------------------------|
-| 1 | Exploding join (join on a low-cardinality column) | Row count blow-up on the join node |
-| 2 | Poor pruning + `SELECT *` (function on the filter column) | Partitions scanned ≈ partitions total |
-| 3 | Large sort on a wide text column | Spilling to local/remote storage |
-| 4 | Correlated subquery | Repeated aggregation / join expansion |
-| 5 | `COUNT(DISTINCT)` + leading-wildcard `LIKE '%…%'` | Full scan, expensive distinct |
-| 6 | Window function with no `PARTITION BY` | Single-node global sort |
+Every query returns at most 100 rows: the heavy work runs server-side, and the final result is aggregated or ends in `ORDER BY ... LIMIT 100` (the `ORDER BY` forces the full computation). That way the CLI never downloads large results to your terminal. Keep this rule when adding queries.
+
+In Query Profile, look for things like: row-count blow-up on join nodes, partitions scanned close to partitions total, spilling to local/remote storage, repeated aggregation from correlated subqueries, and single-node global sorts.
 
 Challenge: for each query, find the bottleneck, rewrite it, and compare the before/after runtime and bytes scanned.
 
@@ -33,7 +28,7 @@ Challenge: for each query, find the bottleneck, rewrite it, and compare the befo
 - A Snowflake account with access to `SNOWFLAKE_SAMPLE_DATA`
 - [Snowflake CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/index) (`pip install snowflake-cli`)
 - A configured connection (`snow connection add`, then `snow connection test -c default`)
-- A role with `USAGE` on a working database and schema, plus `CREATE TABLE` on that schema. Queries 2, 3, 4 and 6 write to temporary tables so the CLI doesn't download millions of rows.
+- A role with `USAGE` on a working database and schema, plus `CREATE TABLE` on that schema. The queries currently create no tables (they return at most 100 rows), but the script still requires `WORK_DB`/`WORK_SCHEMA` and runs in that context.
 
 ## Setup
 
@@ -47,7 +42,7 @@ cp .env.example .env
 | `CONNECTION` | Connection name from `~/.snowflake/config.toml` |
 | `ROLE` | Role to run as |
 | `WAREHOUSE` | Warehouse to run on (a small one is fine) |
-| `WORK_DB` / `WORK_SCHEMA` | Where temporary tables are created |
+| `WORK_DB` / `WORK_SCHEMA` | Database and schema the queries run in (and where temporary tables would be created) |
 | `SQL_FILE` | *(optional)* Override the generated SQL file location |
 
 ## Usage
@@ -65,7 +60,19 @@ To launch several instances in the background, use the wrapper:
 
 The wrapper starts the instances one at a time, waiting a random 1-15 seconds between launches. They overlap, so they run concurrently, which is useful for generating concurrent load and queueing. Each instance gets its own log (`tmp/run_<timestamp>_instance<N>.log`) and its own generated SQL file in `tmp/`. Follow progress with `tail -f tmp/run_<timestamp>_instance*.log`.
 
-Running the main script directly writes the SQL to `tmp/inefficient_queries.sql` and executes it with `snow sql`. The final `SELECT` prints the query IDs.
+Running the main script directly picks a random 2-6 distinct queries from `all_in_one_file.sql`, writes them into one SQL file (`tmp/inefficient_queries.sql`) and runs it with a single `snow sql` call, so all of them execute in one Snowflake session. Between queries the file contains `SELECT SYSTEM$WAIT(n)` with a random 1-15 s pause, so the delays happen inside the session (the warehouse stays busy waiting). If a query fails, the CLI is expected to stop the rest of that file. Query IDs are not printed; use Query History (below).
+
+### How the two scripts divide the work
+
+| | Wrapper | Main script |
+|---|---|---|
+| File | `wrapper_run_deliberately_inefficient_queries.sh [INSTANCES]` | `run_deliberately_inefficient_queries.sh` |
+| Responsibility | Parallelism: launches INSTANCES copies of the main script in the background (`nohup`) | One instance's whole run |
+| Randomness | Random 1-15 s delay between instance launches (`MIN_INTERVAL_IN_SECS`/`MAX_INTERVAL_IN_SECS`) | Random 2-6 queries per session, picked from the pool, with a random 1-15 s `SYSTEM$WAIT` between queries (`MIN_QUERIES`/`MAX_QUERIES`/`MIN_DELAY`/`MAX_DELAY`) |
+| Snowflake work | None | Loads `.env`, checks variables, extracts queries, runs each with `snow sql` |
+| Files | Per-instance log `tmp/run_<stamp>_instance<N>.log` and `SQL_FILE` `tmp/inefficient_queries_<stamp>_instance<N>.sql` | Writes the session preamble plus all picked queries to `SQL_FILE`, then one `snow sql` call |
+
+The only link between them is the `SQL_FILE` environment variable: the wrapper sets it per instance so concurrent runs don't overwrite each other's file, and the main script reads it. The main script knows nothing about the wrapper. With 5 instances you get up to 5 overlapping sessions of 2-6 queries each (up to 30 queries), so size the warehouse accordingly.
 
 ## Finding the queries afterwards
 
