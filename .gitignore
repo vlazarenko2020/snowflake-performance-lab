@@ -13,6 +13,7 @@ config.toml
 nohup.out
 *.log
 tmp/
+FROSTBYTE_TASTY_BYTES_daily_updates/data/
 
 # Claude Code local instructions
 CLAUDE.md
@@ -21,3 +22,7 @@ CLAUDE.md
 .DS_Store
 .vscode/
 .idea/
+
+# Python / uv
+.venv/
+__pycache__/

@@ -1,0 +1,9 @@
+[project]
+name = "tasty-bytes-daily-updates"
+version = "0.1.0"
+description = "Generate and load fictional daily Tasty Bytes CSV batches"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv>=1.2.4",
+    "snowflake-snowpark-python>=1.56.0",
+]
