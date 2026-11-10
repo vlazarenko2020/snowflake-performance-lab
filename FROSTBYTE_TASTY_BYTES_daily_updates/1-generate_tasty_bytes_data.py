@@ -10,13 +10,22 @@ Usage:
 The date is mandatory. OUTPUT_DIR (default ./data) and ORDERS (default 500) are optional; when they
 are left out, the script says which defaults it is using and where the files will be created.
 
-Repeatable: the random values are seeded from the date, so running the same date twice gives
-identical files. (They are not byte-identical to the .sh version: awk and Python use different
-random number generators.)
+IDs: every table gets NEW IDs, always bigger than the current MAX(id) in Snowflake. Before generating,
+the script reads the maximum ID of each table (needs CONNECTION, same settings as 2-load_tasty_bytes_data.py)
+and numbers the new rows MAX+1, MAX+2, ... so they never collide with rows that are already loaded.
+Use --no-snowflake to skip that lookup and number from 1 (offline testing only: the IDs will clash with
+existing data if loaded).
+
+Repeatable: the random values are seeded from the date, so the same date gives the same values. The IDs
+depend on what is in Snowflake when the files are generated, so regenerating a day after it was loaded
+would give the same rows under new IDs (the existing files are kept: see f_already_generated).
+(Not byte-identical to the .sh version: awk and Python use different random number generators.)
 """
 import argparse
 import csv
+import os
 import random
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -67,6 +76,53 @@ def f_money(value):
     return f"{value:.4f}"
 
 
+# Where the current MAX(id) is read from: (key, schema kind, table, id column). "pos" / "customer" map to the
+# TASTY_SCHEMA / TASTY_CUSTOMER_SCHEMA settings, like in 2-load_tasty_bytes_data.py.
+ID_COLUMNS = [
+    ("country_id", "pos", "COUNTRY", "COUNTRY_ID"),
+    ("city_id", "pos", "COUNTRY", "CITY_ID"),
+    ("franchise", "pos", "FRANCHISE", "FRANCHISE_ID"),
+    ("location", "pos", "LOCATION", "LOCATION_ID"),
+    ("truck", "pos", "TRUCK", "TRUCK_ID"),
+    ("menu_id", "pos", "MENU", "MENU_ID"),
+    ("menu_type_id", "pos", "MENU", "MENU_TYPE_ID"),
+    ("menu_item", "pos", "MENU", "MENU_ITEM_ID"),
+    ("customer", "customer", "CUSTOMER_LOYALTY", "CUSTOMER_ID"),
+    ("order", "pos", "ORDER_HEADER", "ORDER_ID"),
+    ("detail", "pos", "ORDER_DETAIL", "ORDER_DETAIL_ID"),
+]
+
+
+def f_fetch_max_ids():
+    """Return {key: MAX(id)} for every ID column in ID_COLUMNS (0 for an empty table), read from Snowflake."""
+    try:
+        from dotenv import load_dotenv
+        from snowflake.snowpark import Session
+    except ImportError:
+        sys.exit("ERROR: snowflake-snowpark-python and python-dotenv are needed to read MAX(id) from Snowflake.\n"
+                 "Run the script with 'uv run' (see README), or use --no-snowflake to number the IDs from 1.")
+    connection_from_env = bool(os.environ.get("CONNECTION", "").strip())
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    connection = os.environ.get("CONNECTION", "").strip()
+    if not connection:
+        sys.exit("ERROR: the CONNECTION variable is not set (or is empty), so MAX(id) cannot be read from Snowflake.\n"
+                 "Set it in the repo's .env (CONNECTION=<name from ~/.snowflake/config.toml>), or use --no-snowflake.")
+    print(f"Reading MAX(id) with Snowflake connection '{connection}' "
+          f"(taken from {'the environment' if connection_from_env else 'the .env file'})")
+    db = os.environ.get("TASTY_DB", "FROSTBYTE_TASTY_BYTES_2")
+    schemas = {"pos": os.environ.get("TASTY_SCHEMA", "RAW_POS"),
+               "customer": os.environ.get("TASTY_CUSTOMER_SCHEMA", "RAW_CUSTOMER")}
+    session = Session.builder.configs({"connection_name": connection}).create()
+    try:
+        ids = {}
+        for key, kind, table, col in ID_COLUMNS:
+            ids[key] = session.sql(f"SELECT COALESCE(MAX({col}), 0) FROM {db}.{schemas[kind]}.{table}").collect()[0][0]
+            print(f"  MAX({table}.{col}) = {ids[key]}")
+        return ids
+    finally:
+        session.close()
+
+
 EXPECTED_FILES = ["country.csv", "franchise.csv", "location.csv", "truck.csv", "menu.csv",
                   "customer_loyalty.csv", "order_header.csv", "order_detail.csv"]
 
@@ -83,14 +139,16 @@ def main():
     parser.add_argument("run_date", nargs="?", help="MANDATORY. The day to generate data for, as YYYY-MM-DD")
     parser.add_argument("output_dir", nargs="?", help=f"base output directory (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("orders", nargs="?", type=int, help=f"number of orders (default: {DEFAULT_ORDERS})")
+    parser.add_argument("--no-snowflake", action="store_true",
+                        help="do not read MAX(id) from Snowflake: number every ID from 1 (offline testing only)")
     args = parser.parse_args()
 
     if args.run_date is None:
         parser.exit(2, (
             "ERROR: the date is mandatory.\n"
             "Provide the day to generate data for as the first argument, in the format YYYY-MM-DD.\n"
-            "It decides the folder name, the order/customer ID range and the random seed, so the same date\n"
-            "always gives the same data and different dates never reuse IDs.\n\n"
+            "It decides the folder name and the random seed. (The IDs are numbered after the current MAX(id)\n"
+            "of each table in Snowflake.)\n\n"
             "Usage:   1-generate_tasty_bytes_data.py YYYY-MM-DD [OUTPUT_DIR] [ORDERS]\n"
             f"Example: 1-generate_tasty_bytes_data.py {date.today().isoformat()}\n"))
 
@@ -114,11 +172,16 @@ def main():
         print(f"ORDERS not provided: generating the default {DEFAULT_ORDERS} orders")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Day-based ID offset keeps IDs unique across daily runs; the same number seeds the RNG.
-    day = (run_date - EPOCH).days
+    # First IDs of this batch: every new row is numbered after the current MAX(id) of its table.
+    if args.no_snowflake:
+        ids = {key: 0 for key, *_ in ID_COLUMNS}
+        print("--no-snowflake: IDs start from 1 (they may clash with data already in Snowflake)")
+    else:
+        ids = f_fetch_max_ids()
+
+    day = (run_date - EPOCH).days         # seeds the RNG (and the shift id)
     rng = random.Random(day)
     ri = rng.randint                      # ri(lo, hi): inclusive, like the awk helper
-    base = day * 1000                     # unique ID range per day
     n_cities = N_CITIES
 
     def f_pick(seq):
@@ -140,7 +203,7 @@ def main():
     f, w = f_writer("country.csv", "COUNTRY_ID,COUNTRY,ISO_CURRENCY,ISO_COUNTRY,CITY_ID,CITY,CITY_POPULATION".split(","))
     with f:
         for i in range(n_cities):
-            w.writerow([i + 1, COUNTRIES[i], CURRENCIES[i], ISO_CODES[i], 100 + i + 1, CITIES[i],
+            w.writerow([ids["country_id"] + i + 1, COUNTRIES[i], CURRENCIES[i], ISO_CODES[i], ids["city_id"] + i + 1, CITIES[i],
                         ri(500000, 12000000)])
 
     # ---------- FRANCHISE ----------
@@ -149,7 +212,7 @@ def main():
         for i in range(1, N_FRANCHISES + 1):
             c = ri(0, n_cities - 1)
             fn, ln = f_pick(FIRST_NAMES), f_pick(LAST_NAMES)
-            w.writerow([i, fn, ln, CITIES[c], COUNTRIES[c], f"{fn.lower()}.{ln.lower()}@example.com", f_phone()])
+            w.writerow([ids["franchise"] + i, fn, ln, CITIES[c], COUNTRIES[c], f"{fn.lower()}.{ln.lower()}@example.com", f_phone()])
 
     # ---------- LOCATION ----------
     loc_city = {}                          # location_id -> city index (used for the order currency)
@@ -157,8 +220,9 @@ def main():
     with f:
         for i in range(1, N_LOCATIONS + 1):
             c = ri(0, n_cities - 1)
-            loc_city[i] = c
-            w.writerow([i, f"zz{i:04d}@abc-def-ghi", f"{CITIES[c]} Square {i}", CITIES[c], CITIES[c],
+            lid = ids["location"] + i
+            loc_city[lid] = c
+            w.writerow([lid, f"zz{lid:04d}@abc-def-ghi", f"{CITIES[c]} Square {lid}", CITIES[c], CITIES[c],
                         ISO_CODES[c], COUNTRIES[c]])
 
     # ---------- TRUCK ----------
@@ -167,7 +231,7 @@ def main():
     with f:
         for i in range(1, N_TRUCKS + 1):
             c, m = ri(0, n_cities - 1), ri(0, 4)
-            w.writerow([i, ri(1, N_FRANCHISES), CITIES[c], CITIES[c], ISO_CODES[c], COUNTRIES[c], ISO_CODES[c],
+            w.writerow([ids["truck"] + i, ids["franchise"] + ri(1, N_FRANCHISES), CITIES[c], CITIES[c], ISO_CODES[c], COUNTRIES[c], ISO_CODES[c],
                         int(rng.random() < 0.3), ri(2005, 2025), MAKES[m], MODELS[m], int(rng.random() < 0.2),
                         ri(2015, 2025), f_rdate(2015, 2025)])
 
@@ -181,11 +245,12 @@ def main():
         for b, brand in enumerate(BRANDS[:N_BRANDS], start=1):
             for k in range(1, 5):
                 n_menu += 1
+                item_id = ids["menu_item"] + n_menu
                 cost = 0.5 + rng.random() * 6
                 sale = cost * (1.8 + rng.random() * 1.5)
-                price[n_menu] = sale
+                price[item_id] = sale
                 health = '{"is_healthy":"%s","calories":%d}' % ("Y" if rng.random() < 0.4 else "N", ri(150, 1200))
-                w.writerow([10000 + n_menu, b, f"Type {b}", brand, n_menu, f"{brand} Item {k}", CATEGORIES[k - 1],
+                w.writerow([ids["menu_id"] + n_menu, ids["menu_type_id"] + b, f"Type {ids['menu_type_id'] + b}", brand, item_id, f"{brand} Item {k}", CATEGORIES[k - 1],
                             f_pick(SUBCATEGORIES), f_money(cost), f_money(sale), health])
 
     # ---------- CUSTOMER_LOYALTY (new sign-ups for the day) ----------
@@ -196,7 +261,7 @@ def main():
                                            "SIGN_UP_DATE,BIRTHDAY,E_MAIL,PHONE_NUMBER").split(","))
     with f:
         for i in range(1, n_cust + 1):
-            cid = base + i
+            cid = ids["customer"] + i
             customers.append(cid)
             c = ri(0, n_cities - 1)
             fn, ln = f_pick(FIRST_NAMES), f_pick(LAST_NAMES)
@@ -212,24 +277,24 @@ def main():
     fd, wd = f_writer("order_detail.csv", ("ORDER_DETAIL_ID,ORDER_ID,MENU_ITEM_ID,DISCOUNT_ID,LINE_NUMBER,QUANTITY,"
                                          "UNIT_PRICE,PRICE,ORDER_ITEM_DISCOUNT_AMOUNT").split(","))
     with fh, fd:
-        detail_id = base * 10
+        detail_id = ids["detail"]
         for o in range(1, n_orders + 1):
-            oid = base + o
-            loc = ri(1, N_LOCATIONS)
+            oid = ids["order"] + o
+            loc = ids["location"] + ri(1, N_LOCATIONS)
             cust_id = rng.choice(customers) if rng.random() < 0.4 else ""
             shift = 1 if rng.random() < 0.5 else 2
             hh = ri(8, 14) if shift == 1 else ri(15, 21)
             ts = f"{args.run_date} {hh:02d}:{ri(0, 59):02d}:{ri(0, 59):02d}"
             amount = 0.0
             for line in range(1, ri(1, 4) + 1):
-                item, qty = ri(1, n_menu), ri(1, 3)
+                item, qty = ids["menu_item"] + ri(1, n_menu), ri(1, 3)
                 unit_price = price[item]
                 line_price = unit_price * qty
                 amount += line_price
                 detail_id += 1
                 wd.writerow([detail_id, oid, item, "", line, qty, f_money(unit_price), f_money(line_price), ""])
             start, end = ("08:00:00", "14:00:00") if shift == 1 else ("15:00:00", "22:00:00")
-            wh.writerow([oid, ri(1, N_TRUCKS), loc, cust_id, "", day * 10 + shift, start, end, "", ts, "",
+            wh.writerow([oid, ids["truck"] + ri(1, N_TRUCKS), loc, cust_id, "", day * 10 + shift, start, end, "", ts, "",
                          CURRENCIES[loc_city[loc]], f_money(amount), "", "", f_money(amount)])
 
     # ---------- summary (like `wc -l`) ----------

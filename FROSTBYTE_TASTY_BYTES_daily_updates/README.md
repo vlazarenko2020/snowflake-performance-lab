@@ -25,7 +25,7 @@ There are two generator scripts that do the same job:
 | `1-generate_tasty_bytes_data.py` | Python 3.7+ (standard library only) | **mandatory** |
 | `generate_tasty_bytes_data.sh` | bash, `awk`, GNU `date` (Linux) | optional (defaults to today) |
 
-Use the Python script unless you have a reason not to: it runs anywhere Python does, and it explains a missing date instead of silently using today. All data is made up (names, emails, phone numbers).
+The Python generator needs a Snowflake connection (it reads `MAX(id)`), so run it with `uv run`; `0-generate_plus_load.sh` already does. Use the Python script unless you have a reason not to: it runs anywhere Python does, and it explains a missing date instead of silently using today. All data is made up (names, emails, phone numbers).
 
 ### Usage
 
@@ -73,9 +73,9 @@ Only the order tables are big. Everything else is deliberately kept to a few row
 - Names come from pools of about 75 first names and 90 last names (plain ASCII, because they are used in the e-mail addresses).
 
 How the data behaves:
-- **New rows each day:** order headers, order details and customers get IDs from a range based on the date (`day number × 1000`), so loading several days never creates duplicate keys.
-- **Lookup tables repeat:** `COUNTRY`, `FRANCHISE`, `LOCATION`, `TRUCK` and `MENU` keep the same IDs every day and their values are regenerated each run. Load them with `MERGE`, not plain inserts.
-- **Linked tables:** orders point to the trucks, locations and menu items of the same batch, and about 40% of them to that day's new customers. Because the lookup sets are small, orders use only 3 cities, 5 locations, 4 trucks and 12 menu items.
+- **New IDs for every table, bigger than the current maximum:** before generating, the Python script reads `MAX(id)` of each table from Snowflake (`COUNTRY_ID`, `CITY_ID`, `FRANCHISE_ID`, `LOCATION_ID`, `TRUCK_ID`, `MENU_ID`, `MENU_TYPE_ID`, `MENU_ITEM_ID`, `CUSTOMER_ID`, `ORDER_ID`, `ORDER_DETAIL_ID`) and numbers the new rows `MAX+1, MAX+2, ...`. So a daily batch never reuses an ID that is already loaded (including historical rows) and never overwrites existing rows. This needs `CONNECTION` (same settings as the loader) and the tables to exist; `--no-snowflake` skips the lookup and numbers from 1 (offline testing only).
+- **Lookup tables grow by a few rows a day:** `COUNTRY`, `FRANCHISE`, `LOCATION`, `TRUCK` and `MENU` get new IDs too, so each batch adds a few new rows. The loader still MERGEs them (which now simply inserts).
+- **Linked tables:** trucks point to the batch's franchises, and orders point to the trucks, locations and menu items of the same batch, and about 40% of them to that day's new customers. Because the lookup sets are small, orders use only 3 cities, 5 locations, 4 trucks and 12 menu items.
 - **Repeatable:** the random values are seeded from the date, so running the same date twice gives identical files.
 - **Empty columns:** `ORDER_CHANNEL`, `DISCOUNT_ID`, `SERVED_TS` and the tax and discount amounts are left empty.
 
@@ -97,7 +97,9 @@ Things to know about this check:
 - The history lists the file as `<date>/<table>.csv` (no stage name in front); the check matches on that.
 - Do not rely on `COPY INTO` alone to skip files: the loader re-`PUT`s the files with `OVERWRITE = TRUE`, and Snowflake then loads them again. That is how a day got loaded twice before this check existed.
 
-To check a day for duplicates, compare `COUNT(*)` with `COUNT(DISTINCT id)` over the day's ID range (`day x 1000 + 1 ... + 999` for orders and customers, `day x 10000 + 1 ...` for order details; the day number is the days since 1970-01-01).
+The IDs depend on what is in Snowflake when the files are generated. If you delete a day's folder and generate it again after it was loaded, you get the same values under new, bigger IDs: loading that would add the day a second time. Delete the day's rows from Snowflake first.
+
+To check a day for duplicates, compare `COUNT(*)` with `COUNT(DISTINCT id)` over the day's ID range (the IDs of that batch are the CSV's ID column: take its min and max).
 
 ## Differences between the two scripts
 
