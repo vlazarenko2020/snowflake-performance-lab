@@ -11,6 +11,7 @@ Run 1-generate_tasty_bytes_data.py first, then:
     e.g. uv run 2-load_tasty_bytes_data.py 2026-11-08 ./data
 
 What it does, in order:
+  0. skips every fact-table file that COPY_HISTORY (last 14 days) shows as already loaded (unless --force),
   1. creates the internal stage if it does not exist,
   2. PUTs DATA_DIR/<date>/*.csv to @<stage>/<date>/,
   3. lookup tables (country, franchise, location, truck, menu): COPY into a temporary table, then MERGE
@@ -68,6 +69,34 @@ def csv_header(path):
     """Return the column names (first row) of a CSV file as a list. Used to build the MERGE statement."""
     with open(path, newline="", encoding="utf-8") as f:
         return next(csv.reader(f))
+
+
+def f_loaded_fact_files(session, db, schemas, run_date):
+    """Return the set of fact-table file stems (e.g. 'order_header') that COPY_HISTORY shows as loaded for `run_date`.
+
+    Uses <db>.INFORMATION_SCHEMA.COPY_HISTORY, which only keeps the last 14 days and is kept per table
+    (truncating or recreating a table wipes its history). A day older than 14 days cannot be verified, so
+    the answer is an empty set. Every fact table is checked, so a partly loaded day is reported exactly.
+    """
+    if session is None:                                   # dry run: nothing to ask Snowflake
+        return set()
+    if (date.today() - date.fromisoformat(run_date)).days >= 14:
+        print(f"Note: {run_date} is outside the 14-day COPY_HISTORY window, so 'already loaded' cannot be checked")
+        return set()
+    loaded = set()
+    for stem, table, kind, key in TABLES:
+        if key is not None:                               # lookup tables are MERGEd: re-running them is harmless
+            continue
+        rows = session.sql(
+            f"SELECT COUNT(*) FROM TABLE({db}.INFORMATION_SCHEMA.COPY_HISTORY("
+            f"TABLE_NAME => '{db}.{schemas[kind]}.{table}', "
+            f"START_TIME => DATEADD(day, -14, CURRENT_TIMESTAMP()))) "
+            f"WHERE STATUS = 'Loaded' AND FILE_NAME LIKE '%{run_date}/{stem}.csv'").collect()
+        n = rows[0][0]
+        print(f"  check> {table}: {n} 'Loaded' entr{'y' if n == 1 else 'ies'} in COPY_HISTORY for {stem}.csv")
+        if n > 0:
+            loaded.add(stem)
+    return loaded
 
 
 def main():
@@ -169,6 +198,14 @@ def main():
         return rows
 
     try:
+        # Skip the whole day (no PUT, no COPY) when the copy history says it was already loaded.
+        loaded = set() if args.force else f_loaded_fact_files(session, db, schemas, args.run_date)
+        fact_stems = {stem for stem, _, _, key in TABLES if key is None}
+        if fact_stems and fact_stems <= loaded:
+            print(f"Data for {args.run_date} has already been loaded into {db}: nothing to do (use --force to reload)")
+            return
+        if loaded:
+            print(f"Already loaded, will be skipped: {', '.join(sorted(loaded))}")
         print(f"Loading {src_dir.resolve()} -> {db} (stage {stage}){'  [dry run]' if args.dry_run else ''}")
 
         # ------------------------------------------------------------ 5. Create the stage
@@ -179,6 +216,8 @@ def main():
         # Local files -> stage. AUTO_COMPRESS=FALSE keeps them as plain .csv, so the FILES = ('name.csv')
         # lists below match. OVERWRITE=TRUE replaces a file of the same name from an earlier run of this day.
         for stem, *_ in TABLES:
+            if stem in loaded:
+                continue
             path = src_dir / f"{stem}.csv"
             print(f"PUT {path.name}")
             if session is None:
@@ -189,6 +228,9 @@ def main():
 
         # ------------------------------------------------------------ 7. Load every table
         for stem, table, kind, key in TABLES:
+            if stem in loaded:
+                print(f"SKIP {stem}.csv: already loaded")
+                continue
             target = f"{db}.{schemas[kind]}.{table}"
             print(f"LOAD {stem}.csv -> {target}" + (" (merge)" if key else ""))
             # MATCH_BY_COLUMN_NAME maps CSV columns to table columns by header name (not by position), so the
