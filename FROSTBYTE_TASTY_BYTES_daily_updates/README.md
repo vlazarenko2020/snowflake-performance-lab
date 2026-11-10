@@ -8,7 +8,7 @@ Generators for a fictional **daily batch of CSV files** for the Tasty Bytes tabl
 ./0-generate_plus_load.sh 2026-11-08
 ```
 
-`0-generate_plus_load.sh YYYY-MM-DD` runs step 1 (`1-generate_tasty_bytes_data.py`) and then step 2 (`2-load_tasty_bytes_data.py`) with the same date, using their defaults (`./data`, 500 orders). The date is mandatory: with no date, a malformed or impossible date, or extra arguments, it explains what is needed and exits with code 2. It stops if the generator fails, so the loader never runs on missing files. Loading needs `CONNECTION` (see [Running with uv and loading with Snowpark](#running-with-uv-and-loading-with-snowpark)).
+`0-generate_plus_load.sh YYYY-MM-DD` runs step 1 (`1-generate_tasty_bytes_data.py`) and then step 2 (`2-load_tasty_bytes_data.py`) with the same date, using their defaults (`./data`, 500 orders). The date is mandatory: with no date, a malformed or impossible date, or extra arguments, it explains what is needed and exits with code 2. It stops if the generator fails, so the loader never runs on missing files. Loading needs `CONNECTION` (see [Running with uv and loading with Snowpark](#running-with-uv-and-loading-with-snowpark)). It is safe to run twice for the same date: the generator and the loader each detect work that is already done and skip it (see [Running the same date again](#running-the-same-date-again)).
 
 | Step | Script |
 |------|--------|
@@ -52,47 +52,63 @@ The `.sh` file is not marked executable, so run it with `bash` (or `chmod +x` it
 
 ## What gets generated
 
-For `ORDERS = 500`, the row counts (excluding the header) are:
+Only the order tables are big. Everything else is deliberately kept to a few rows per daily batch (the sizes are the `N_*` constants near the top of `1-generate_tasty_bytes_data.py`). For `ORDERS = 500`, the row counts (excluding the header) are:
 
 | File | Rows | Kind |
 |------|------|------|
-| `country.csv` | 15 (one per city) | Lookup |
-| `franchise.csv` | 20 | Lookup |
-| `location.csv` | 60 | Lookup |
-| `truck.csv` | 45 | Lookup |
-| `menu.csv` | 60 (15 brands × 4 items) | Lookup |
-| `customer_loyalty.csv` | `ORDERS / 10 + 1` (51) | New each day |
+| `country.csv` | 3 (one per city, `N_CITIES`) | Lookup |
+| `franchise.csv` | 3 (`N_FRANCHISES`) | Lookup |
+| `location.csv` | 5 (`N_LOCATIONS`) | Lookup |
+| `truck.csv` | 4 (`N_TRUCKS`) | Lookup |
+| `menu.csv` | 12 (3 brands x 4 items, `N_BRANDS`) | Lookup |
+| `customer_loyalty.csv` | 5 (`N_CUSTOMERS`) | New each day |
 | `order_header.csv` | `ORDERS` (500) | New each day |
 | `order_detail.csv` | 1-4 lines per order (about 1,250) | New each day |
 
-**Records per run (default `ORDERS = 500`):** about **1,800 data rows** in total, excluding headers.
-- The five lookup files are fixed at 200 rows (15 + 20 + 60 + 45 + 60), whatever `ORDERS` is.
-- The three daily files scale with `ORDERS`: `customer_loyalty` (`ORDERS / 10 + 1`), `order_header` (`ORDERS`) and `order_detail` (1-4 lines per order, so about `2.5 × ORDERS`). At 500 orders that is 51 + 500 + about 1,250 = about 1,800 rows.
+**Records per run (default `ORDERS = 500`):** about **1,780 data rows** in total, excluding headers.
+- The five lookup files and `customer_loyalty` are fixed at 32 rows (3 + 3 + 5 + 4 + 12 + 5), whatever `ORDERS` is.
+- The two order files scale with `ORDERS`: `order_header` (`ORDERS`) and `order_detail` (1-4 lines per order, so about `2.5 x ORDERS`).
 - The exact `order_detail` count varies with the date, because each order gets a random number of lines. The same date and `ORDERS` always give the same count.
 - Change the volume with the `ORDERS` argument of `1-generate_tasty_bytes_data.py`. `0-generate_plus_load.sh` always uses the default of 500.
+- Names come from pools of about 75 first names and 90 last names (plain ASCII, because they are used in the e-mail addresses).
 
 How the data behaves:
 - **New rows each day:** order headers, order details and customers get IDs from a range based on the date (`day number × 1000`), so loading several days never creates duplicate keys.
 - **Lookup tables repeat:** `COUNTRY`, `FRANCHISE`, `LOCATION`, `TRUCK` and `MENU` keep the same IDs every day and their values are regenerated each run. Load them with `MERGE`, not plain inserts.
-- **Linked tables:** orders point to existing trucks, locations and menu items, and about 40% of them to that day's new customers.
+- **Linked tables:** orders point to the trucks, locations and menu items of the same batch, and about 40% of them to that day's new customers. Because the lookup sets are small, orders use only 3 cities, 5 locations, 4 trucks and 12 menu items.
 - **Repeatable:** the random values are seeded from the date, so running the same date twice gives identical files.
 - **Empty columns:** `ORDER_CHANNEL`, `DISCOUNT_ID`, `SERVED_TS` and the tax and discount amounts are left empty.
 
 ## Running the same date again
 
-The scripts write into `OUTPUT_DIR/<date>/` and overwrite the files that are already there. With the same date and the same `ORDERS` the new files are identical. With a different `ORDERS` the content changes. A different date creates a new folder and leaves earlier days alone. Nothing is ever deleted.
+Both Python scripts detect work that is already done, so `0-generate_plus_load.sh <date>` can be run repeatedly.
 
-If you have already loaded that day into Snowflake, loading it again inserts duplicates. `COPY INTO` skips files it has already loaded unless you re-`PUT` them with `OVERWRITE = TRUE` or load with `FORCE = TRUE`.
+**Generator (`f_already_generated`).** If `OUTPUT_DIR/<date>/` already holds all 8 CSV files (none empty), it prints `Data for <date> has already been generated ... nothing to do` and exits without rewriting anything. A folder with only some of the files counts as not generated and is rebuilt. There is no `--force`: to regenerate a day, delete its folder. (The old `.sh` generator has no such check and overwrites the files.)
+
+**Loader (`f_loaded_fact_files`).** Before uploading anything it asks Snowflake's `<db>.INFORMATION_SCHEMA.COPY_HISTORY` which fact files of that date are already loaded, and prints one `check>` line per fact table:
+- All three fact files loaded: it prints `Data for <date> has already been loaded ... nothing to do` and exits (no PUT, no COPY).
+- Only some loaded: those files are skipped (`SKIP <file>: already loaded`, no PUT, no COPY) and only the missing ones are loaded.
+- `--force` ignores the history and loads everything again (this creates duplicates if the data is there).
+- The lookup tables are always re-MERGEd, which is harmless.
+
+Things to know about this check:
+- `COPY_HISTORY` only goes back 14 days. For an older date the loader prints a note and cannot tell, so it loads.
+- The history is kept per table: truncating or recreating a table erases it, and the loader will then load that day again. If you delete rows by hand and want them back, reload with `--force`.
+- The history lists the file as `<date>/<table>.csv` (no stage name in front); the check matches on that.
+- Do not rely on `COPY INTO` alone to skip files: the loader re-`PUT`s the files with `OVERWRITE = TRUE`, and Snowflake then loads them again. That is how a day got loaded twice before this check existed.
+
+To check a day for duplicates, compare `COUNT(*)` with `COUNT(DISTINCT id)` over the day's ID range (`day x 1000 + 1 ... + 999` for orders and customers, `day x 10000 + 1 ...` for order details; the day number is the days since 1970-01-01).
 
 ## Differences between the two scripts
 
-- **Values:** the two scripts produce the same tables, columns, row counts and ID scheme, but not the same values. awk and Python use different random number generators. Each script is repeatable on its own.
+- **Sizes:** only the Python script has the reduced lookup sizes, the larger name pools and the "already generated" check. The `.sh` script still generates the original, larger lookup sets (15 cities, 20 franchises, 60 locations, 45 trucks, 60 menu items, `ORDERS / 10 + 1` customers).
+- **Values:** the two scripts produce the same tables, columns and ID scheme, but not the same values. awk and Python use different random number generators. Each script is repeatable on its own.
 - **Quoting:** the shell script always quotes brand, location and the health JSON column. The Python script (`csv` module) quotes a field only when it has to. Both load the same with `FIELD_OPTIONALLY_ENCLOSED_BY = '"'`.
 - **Day number:** the shell script gets it from `date -d`, which uses your local timezone. The Python script counts days since 1970-01-01 in UTC. In a timezone ahead of UTC they could differ by one day, which shifts the ID range. Pick one script and stay with it for a given set of days.
 
 ## Running with uv and loading with Snowpark
 
-This folder is a [uv](https://docs.astral.sh/uv/) project (`pyproject.toml`, `uv.lock`, Python 3.12 in `.python-version`). Dependencies: `snowflake-snowpark-python` and `python-dotenv`. The generator itself needs neither.
+This folder is a [uv](https://docs.astral.sh/uv/) project (`pyproject.toml`, `uv.lock`, Python 3.12 in `.python-version`). Dependencies: `snowflake-snowpark-python` and `python-dotenv`. The generator itself needs neither. In the Python scripts the helper functions are prefixed `f_` (for example `f_pick`, `f_writer`), except `main`.
 
 ```bash
 cd FROSTBYTE_TASTY_BYTES_daily_updates
@@ -104,7 +120,7 @@ uv run 2-load_tasty_bytes_data.py 2026-11-08            # 3. load into Snowflake
 
 `2-load_tasty_bytes_data.py YYYY-MM-DD [DATA_DIR] [--force] [--dry-run]` connects with Snowpark, creates the stage, PUTs the day's CSVs and loads them:
 - **Lookup tables** (`country`, `franchise`, `location`, `truck`, `menu`): `COPY` into a temporary table, then `MERGE` on `CITY_ID`, `FRANCHISE_ID`, `LOCATION_ID`, `TRUCK_ID` and `MENU_ITEM_ID`. Re-running a day updates rows and creates no duplicates.
-- **Fact tables** (`customer_loyalty`, `order_header`, `order_detail`): plain `COPY INTO`. Snowflake skips files it has already loaded, so a re-run does not duplicate rows; `--force` overrides that.
+- **Fact tables** (`customer_loyalty`, `order_header`, `order_detail`): plain `COPY INTO`. Files that `COPY_HISTORY` shows as already loaded are skipped before the upload, so a re-run does not duplicate rows; `--force` overrides that (see [Running the same date again](#running-the-same-date-again)).
 - Columns are matched by the CSV header names, so the target tables must already exist with those column names. The date is mandatory, as in the generator.
 
 Settings come from the environment or the repo's git-ignored `.env` (one level up), like the performance-lab scripts: `CONNECTION` (required, a connection name from `~/.snowflake/config.toml`) and optional `TASTY_DB` (default `FROSTBYTE_TASTY_BYTES_2`), `TASTY_SCHEMA` (`RAW_POS`), `TASTY_CUSTOMER_SCHEMA` (`RAW_CUSTOMER`) and `TASTY_STAGE` (`DAILY_LOAD`). Only the connection **name** is read: the account, user, authentication, **role and warehouse** all come from that connection in `config.toml` (`ROLE` and `WAREHOUSE` in `.env` are ignored by this script). Make sure the connection's role has the needed privileges (`CREATE STAGE`, `CREATE TABLE`, `INSERT`/`UPDATE` on the Tasty Bytes tables).

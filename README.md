@@ -13,6 +13,8 @@ A small sandbox for practising Snowflake query performance tuning. It runs a set
     └── inefficient_queries/all_in_one_file.sql   # Query pool (50 numbered queries) the script picks from
 ```
 
+A second, separate part of the repo, `FROSTBYTE_TASTY_BYTES_daily_updates/`, generates fictional daily CSV batches for the Tasty Bytes tables and loads them into Snowflake (`./0-generate_plus_load.sh YYYY-MM-DD`). It has its own README.
+
 ## The queries
 
 `all_in_one_file.sql` holds 50 numbered queries (`-- N. Description`, each ending with `;`). Each run picks a random 2-6 of them and sends them to Snowflake together in one session. Every query demonstrates one common anti-pattern (for example a function on a filter column that defeats pruning, a Cartesian or exploding join, a correlated subquery, an unpartitioned window function, or a huge sort), and the description in its header comment names it.
