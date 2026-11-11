@@ -84,18 +84,18 @@ def f_loaded_fact_files(session, db, schemas, run_date):
         print(f"Note: {run_date} is outside the 14-day COPY_HISTORY window, so 'already loaded' cannot be checked")
         return set()
     loaded = set()
-    for stem, table, kind, key in TABLES:
+    for csv_file_stem, table, kind, key in TABLES:
         if key is not None:                               # lookup tables are MERGEd: re-running them is harmless
             continue
         rows = session.sql(
             f"SELECT COUNT(*) FROM TABLE({db}.INFORMATION_SCHEMA.COPY_HISTORY("
             f"TABLE_NAME => '{db}.{schemas[kind]}.{table}', "
             f"START_TIME => DATEADD(day, -14, CURRENT_TIMESTAMP()))) "
-            f"WHERE STATUS = 'Loaded' AND FILE_NAME LIKE '%{run_date}/{stem}.csv'").collect()
+            f"WHERE STATUS = 'Loaded' AND FILE_NAME LIKE '%{run_date}/{csv_file_stem}.csv'").collect()
         n = rows[0][0]
-        print(f"  check> {table}: {n} 'Loaded' entr{'y' if n == 1 else 'ies'} in COPY_HISTORY for {stem}.csv")
+        print(f"  check> {table}: {n} 'Loaded' entr{'y' if n == 1 else 'ies'} in COPY_HISTORY for {csv_file_stem}.csv")
         if n > 0:
-            loaded.add(stem)
+            loaded.add(csv_file_stem)
     return loaded
 
 
@@ -129,15 +129,19 @@ def main():
     except ValueError:
         parser.error(f"invalid date '{args.run_date}', expected YYYY-MM-DD")
 
-    # The generator writes DATA_DIR/<date>/*.csv; stop early with a hint if that folder or any file is missing,
-    # so we never start a half-finished load.
+    # Pre-flight check of the input files. 1-generate_tasty_bytes_data.py writes one folder per run date,
+    # DATA_DIR/<date>/, holding one CSV per table (see TABLES). Before connecting to Snowflake, verify that
+    # the folder exists and that every expected CSV is in it. If anything is missing, exit with an error that
+    # names the missing folder or files and says how to generate them, so we never start a half-finished load
+    # (e.g. some tables loaded and others not).
     src_dir = Path(args.data_dir) / args.run_date
     if not src_dir.is_dir():
         parser.exit(1, (f"ERROR: {src_dir.resolve()} does not exist.\n"
                         f"Generate it first: 1-generate_tasty_bytes_data.py {args.run_date} {args.data_dir}\n"))
-    missing = [stem + ".csv" for stem, *_ in TABLES if not (src_dir / (stem + ".csv")).is_file()]
-    if missing:
-        parser.exit(1, f"ERROR: missing files in {src_dir.resolve()}: {', '.join(missing)}\n")
+    expected_csv_files = [t[0] + ".csv" for t in TABLES]
+    missing_csv_files = [name for name in expected_csv_files if not (src_dir / name).is_file()]
+    if missing_csv_files:
+        parser.exit(1, f"ERROR: missing files in {src_dir.resolve()}: {', '.join(missing_csv_files)}\n")
 
     # ---------------------------------------------------------------- 3. Settings from .env / environment
     # Same .env as the performance-lab scripts (repo root, one level up from this folder). It is optional;
@@ -200,7 +204,7 @@ def main():
     try:
         # Skip the whole day (no PUT, no COPY) when the copy history says it was already loaded.
         loaded = set() if args.force else f_loaded_fact_files(session, db, schemas, args.run_date)
-        fact_stems = {stem for stem, _, _, key in TABLES if key is None}
+        fact_stems = {csv_file_stem for csv_file_stem, _, _, key in TABLES if key is None}
         if fact_stems and fact_stems <= loaded:
             print(f"Data for {args.run_date} has already been loaded into {db}: nothing to do (use --force to reload)")
             return
@@ -211,28 +215,30 @@ def main():
         # ------------------------------------------------------------ 5. Create the stage
         # The stage is the Snowflake-side folder the files are uploaded to before they are loaded.
         run(f"CREATE STAGE IF NOT EXISTS {stage}")
+        print()
 
         # ------------------------------------------------------------ 6. Upload (PUT) the CSV files
         # Local files -> stage. AUTO_COMPRESS=FALSE keeps them as plain .csv, so the FILES = ('name.csv')
         # lists below match. OVERWRITE=TRUE replaces a file of the same name from an earlier run of this day.
-        for stem, *_ in TABLES:
-            if stem in loaded:
+        for csv_file_stem, *_ in TABLES:
+            if csv_file_stem in loaded:
                 continue
-            path = src_dir / f"{stem}.csv"
+            path = src_dir / f"{csv_file_stem}.csv"
             print(f"PUT {path.name}")
             if session is None:
                 print(f"  PUT file://{path.resolve()} {stage_dir}/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE")
             else:
                 for r in session.file.put(str(path.resolve()), stage_dir, auto_compress=False, overwrite=True):
                     print(f"       {r.source} -> {r.status}")
+            print()
 
         # ------------------------------------------------------------ 7. Load every table
-        for stem, table, kind, key in TABLES:
-            if stem in loaded:
-                print(f"SKIP {stem}.csv: already loaded")
+        for csv_file_stem, table, kind, key in TABLES:
+            if csv_file_stem in loaded:
+                print(f"SKIP {csv_file_stem}.csv: already loaded\n")
                 continue
             target = f"{db}.{schemas[kind]}.{table}"
-            print(f"LOAD {stem}.csv -> {target}" + (" (merge)" if key else ""))
+            print(f"LOAD {csv_file_stem}.csv -> {target}" + (" (merge)" if key else ""))
             # MATCH_BY_COLUMN_NAME maps CSV columns to table columns by header name (not by position), so the
             # table may have extra columns or a different column order. Matching ignores upper/lower case.
             copy_opts = f"FILE_FORMAT = {FILE_FORMAT} MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE"
@@ -241,8 +247,9 @@ def main():
             #     Snowflake remembers which staged files it already loaded and skips them, which makes a
             #     re-run of the same day safe. --force loads them again anyway (this can create duplicates).
             if key is None:
-                run(f"COPY INTO {target} FROM {stage_dir}/ FILES = ('{stem}.csv') {copy_opts}"
+                run(f"COPY INTO {target} FROM {stage_dir}/ FILES = ('{csv_file_stem}.csv') {copy_opts}"
                     + (" FORCE = TRUE" if args.force else ""))
+                print()
                 continue
 
             # 7b. Lookup table (has a merge key): the same rows come back every day with regenerated values,
@@ -251,15 +258,16 @@ def main():
             #          session ends),
             #       2) COPY the file into that temporary table,
             #       3) MERGE: rows whose key already exists are updated, new keys are inserted.
-            cols = csv_header(src_dir / f"{stem}.csv")                          # column names from the CSV header
+            cols = csv_header(src_dir / f"{csv_file_stem}.csv")                          # column names from the CSV header
             stg = f"{db}.{schemas[kind]}.STG_{table}"                            # fully qualified: the session may have no default schema
             on = " AND ".join(f"t.{k} = s.{k}" for k in key)                     # join condition on the key column(s)
             sets = ", ".join(f"t.{c} = s.{c}" for c in cols if c not in key)    # update every non-key column
             run(f"CREATE OR REPLACE TEMPORARY TABLE {stg} LIKE {target}")
-            run(f"COPY INTO {stg} FROM {stage_dir}/ FILES = ('{stem}.csv') {copy_opts}")
+            run(f"COPY INTO {stg} FROM {stage_dir}/ FILES = ('{csv_file_stem}.csv') {copy_opts}")
             run(f"MERGE INTO {target} t USING {stg} s ON {on} "
                 f"WHEN MATCHED THEN UPDATE SET {sets} "
                 f"WHEN NOT MATCHED THEN INSERT ({', '.join(cols)}) VALUES ({', '.join('s.' + c for c in cols)})")
+            print()
         print("Done.")
     finally:
         # ---------------------------------------------------------------- 8. Always close the session
